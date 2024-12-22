@@ -56,6 +56,9 @@ class AddDevicesToDNS(Script):
         label="DNS path template",
         default="""{{ data.ip.ip | clear_dns }}-id{{ data.ip_id }}.
 {{ (data.interface if data.interface else filler) | clear_dns }}.
+{% if data.vm %}
+{{ data.vm | clear_dns }}.
+{% endif %}
 {{ (data.device if data.device else filler) | clear_dns }}.
 {{ (data.rack if data.rack else filler) | clear_dns }}.
 {{ (data.site if data.site else filler) | clear_dns }}.
@@ -109,6 +112,7 @@ class AddDevicesToDNS(Script):
             for ip in all_ips:
                 context = {
                     'interface': None,
+                    'vm': None,
                     'device': [],
                     'rack': [],
                     'site': [],
@@ -121,20 +125,27 @@ class AddDevicesToDNS(Script):
                 if ip.assigned_object:
                     context['interface'] = ip.assigned_object
 
-                    device = ip.assigned_object.device
-                    context['device'] = device
+                    device = None
+                    if ip.assigned_object_type.model == 'interface':
+                        device = ip.assigned_object.device
+                    elif ip.assigned_object_type.model == 'vminterface':
+                        context['vm'] = ip.assigned_object.parent_object
+                        device = context['vm'].device
 
-                    if device.rack:
-                        context['rack'] = device.rack
-                    
-                    context['site'] = device.site
+                    if device is not None:
+                        context['device'] = device
 
-                    region = device.site.region
-                    chain = []
-                    while region:
-                        chain.append(region)
-                        region = region.parent
-                    context['region'] = chain
+                        if device.rack:
+                            context['rack'] = device.rack
+
+                        context['site'] = device.site
+
+                        region = device.site.region
+                        chain = []
+                        while region:
+                            chain.append(region)
+                            region = region.parent
+                        context['region'] = chain
 
                 subdomain = template.render(data=context, filler=dns_name_clean(data['default_filler']))
                 if data['remove_chain_of_fillers']:
