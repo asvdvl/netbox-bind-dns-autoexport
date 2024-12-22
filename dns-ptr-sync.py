@@ -3,6 +3,7 @@ from ipam.models import IPAddress
 from extras.models.customfields import CustomField
 from netbox_dns.models import NameServer, Zone
 from core.models import ObjectType
+from netbox_dns.choices import RecordTypeChoices
 
 from pprint import pp
 import re
@@ -72,13 +73,24 @@ class AddDevicesToDNS(Script):
         default=True,
     )
 
+    remove_other_records_in_zone = BooleanVar(
+        description="BE CAREFUL! this will delete all other records in the zone, useful when you allocate a separate zone for generated records, which is recommended",
+        default=False,
+    )
+
     def run(self, data, commit):
         pp(data)
         nameservers = data["only_for_servers"] if len(data["only_for_servers"]) > 0 else NameServer.objects.all()
 
         for server in nameservers:
             if not ptr_zone_cust_field_name in server.custom_field_data:
-                raise ValueError("ptr_zone not found! Please run `Add Ptr Zone To Cust Fields` script first")
+                reason = "ptr_zone not found! Please run `Add Ptr Zone To Cust Fields` script first"
+                self.log_failure(reason)
+                raise ValueError(reason)
+
+            if server.custom_field_data[ptr_zone_cust_field_name] is None:
+                self.log_failure(f"ptr zone is empty for `{server}`")
+                continue
 
             all_ips = {}
             if server.tenant is not None or data['allow_none_tenant']: #ignore None tenant if allow_none_tenant
@@ -91,6 +103,8 @@ class AddDevicesToDNS(Script):
             jenv.filters['clear_dns'] = dns_name_clean
 
             template = jenv.from_string(data['name_template'].replace('\n', '').replace('\r', ''))
+            valid_records = []
+            zone = Zone.objects.get(pk=server.custom_field_data[ptr_zone_cust_field_name])
 
             for ip in all_ips:
                 context = {
@@ -122,8 +136,6 @@ class AddDevicesToDNS(Script):
                         region = region.parent
                     context['region'] = chain
 
-
-
                 subdomain = template.render(data=context, filler=dns_name_clean(data['default_filler']))
                 if data['remove_chain_of_fillers']:
                     subdomain = re.sub(rf"(\.{data['default_filler']}){{2,}}", f".{data['default_filler']}", subdomain)
@@ -136,4 +148,24 @@ class AddDevicesToDNS(Script):
 
                 self.log_debug(f"got `{subdomain}` for ip `{ip.address}`")
                 
+                records = zone.records
+                if len(records.model.objects.filter(name=subdomain)) == 0:
+                    records.model.objects.create(
+                        name = subdomain,
+                        value = ip.address.ip,
+                        zone = zone,
+                        type = RecordTypeChoices.AAAA if ip.family == 6 else RecordTypeChoices.A,
+                        tenant = zone.tenant
+                    )
+                    self.log_info(f'added `{subdomain}` record, zone `{zone.name}`')
+                else:
+                    self.log_debug(f'`{subdomain}` record, already exist in zone `{zone.name}`')
                 
+                valid_records.append(subdomain)
+            
+            if data['remove_other_records_in_zone']:
+                for record in zone.records.exclude(name__in=valid_records).filter(type__in=[RecordTypeChoices.A, RecordTypeChoices.AAAA]):
+                    if record.name not in valid_records:
+                        self.log_info(f'removing {record.name} in {zone.name}')
+                        record.delete()
+
