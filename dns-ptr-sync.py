@@ -10,7 +10,9 @@ import re
 from jinja2 import Environment
 
 name = "Add devices to DNS"
-ptr_zone_cust_field_name = 'ptr_zone'
+ptr_zone_cust_field_name_default = 'ptr_zone'
+ENABLE_FILTER_TEMPLATE_SELECTION=True   #enables template filter in AddDevicesToDNS
+FILTER_TEMPLATE_PREFIX='dnsPtrGen'
 
 def dns_name_clean(name):
     defises = re.sub(r'[^a-zA-Z0-9-]', '-', str(name)) #replaces all invalid characters with -
@@ -20,14 +22,21 @@ class AddPtrZoneToCustFields(Script):
     class Meta:
         name = "Add Ptr Zone To Cust Fields"
         description = ""
+
+    ptr_zone_cust_field_name = StringVar(
+        label="zone name",
+        default=ptr_zone_cust_field_name_default,
+        description="Enter your value here if you have multiple zones for different purposes"
+    )
+
     def run(self, data, commit):
-        fields=CustomField.objects.filter(name = ptr_zone_cust_field_name)
-        #for item in CustomField.objects.filter(name = 'ptr_exmlpl'):
-        #    pp(item)
+        ptr_zone_name = data["ptr_zone_cust_field_name"]
+        fields=CustomField.objects.filter(name = ptr_zone_name)
+
         if len(fields) == 0:
             custom_field = CustomField.objects.create(
-                name=ptr_zone_cust_field_name,
-                label="PTR export zone",
+                name=ptr_zone_name,
+                label=f"PTR export zone({ptr_zone_name})",
                 type='object',
                 required=False,
                 related_object_type=ObjectType.objects.get_for_model(Zone),
@@ -52,21 +61,6 @@ class AddDevicesToDNS(Script):
         required=False
     )
 
-    name_template = TextVar(
-        label="DNS path template",
-        default="""{{ data.ip.ip | clear_dns }}-id{{ data.ip_id }}.
-{{ (data.interface if data.interface else filler) | clear_dns }}.
-{% if data.vm %}
-{{ data.vm | clear_dns }}.
-{% endif %}
-{{ (data.device if data.device else filler) | clear_dns }}.
-{{ (data.rack if data.rack else filler) | clear_dns }}.
-{{ (data.site if data.site else filler) | clear_dns }}.
-{{ data.region | map('clear_dns') | join('.') if data.region else filler }}
-""",
-        description="all line breaks will be removed, use them for formatting"
-    )
-
     default_filler = StringVar(
         label="default filler for unknown values",
         default="no-data"
@@ -81,9 +75,33 @@ class AddDevicesToDNS(Script):
         default=False,
     )
 
+    template = ObjectVar(
+        label="Select template",
+        description="selectable from custom templates, if selected, the template below will be ignored",
+        model=ExportTemplate,
+        required=False,
+        query_params=(
+            {"name__isw": FILTER_TEMPLATE_PREFIX} if ENABLE_FILTER_TEMPLATE_SELECTION else {}
+        ),
+        
+    )
+    name_template = TextVar(
+        label="DNS path template",
+        default="""{{ data.ip.ip | clear_dns }}-id{{ data.ip_id }}.
+{% if data.vm %}
+{{ data.vm | clear_dns }}.
+{% endif %}
+{{ (data.device if data.device else filler) | clear_dns }}
+""",
+        description="all line breaks will be removed, use them for formatting"
+    )
+
     def run(self, data, commit):
         pp(data)
         nameservers = data["only_for_servers"] if len(data["only_for_servers"]) > 0 else NameServer.objects.all()
+        name_template = data['name_template'] if data['template'] is None else data['template'].template_code
+        name_template = name_template.replace('\n', '').replace('\r', '')
+        default_filler = data['default_filler']
 
         for server in nameservers:
             if not ptr_zone_cust_field_name in server.custom_field_data:
@@ -180,3 +198,4 @@ class AddDevicesToDNS(Script):
                         self.log_info(f'removing {record.name} in {zone.name}')
                         record.delete()
 
+script_order = (AddPtrZoneToCustFields, AddDevicesToDNS)
