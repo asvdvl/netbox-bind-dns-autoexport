@@ -1,6 +1,7 @@
-from extras.scripts import Script, BooleanVar, MultiObjectVar, StringVar, TextVar
+from extras.scripts import Script, BooleanVar, MultiObjectVar, StringVar, TextVar, ObjectVar, ChoiceVar
 from ipam.models import IPAddress
 from extras.models.customfields import CustomField
+from extras.models import ExportTemplate
 from netbox_dns.models import NameServer, Zone
 from core.models import ObjectType
 from netbox_dns.choices import RecordTypeChoices
@@ -83,8 +84,8 @@ class AddDevicesToDNS(Script):
         query_params=(
             {"name__isw": FILTER_TEMPLATE_PREFIX} if ENABLE_FILTER_TEMPLATE_SELECTION else {}
         ),
-        
     )
+
     name_template = TextVar(
         label="DNS path template",
         default="""{{ data.ip.ip | clear_dns }}-id{{ data.ip_id }}.
@@ -96,6 +97,19 @@ class AddDevicesToDNS(Script):
         description="all line breaks will be removed, use them for formatting"
     )
 
+    ptr_zone_name = ObjectVar(
+        label="Zone name",
+        description="",
+        model=CustomField,
+        required=True,
+        query_params=(
+            {"related_object_type": "netbox_dns.zone"}
+        ),
+        default=CustomField.objects.filter(
+            name=ptr_zone_cust_field_name_default
+        ).first().id
+    )
+
     def run(self, data, commit):
         pp(data)
         nameservers = data["only_for_servers"] if len(data["only_for_servers"]) > 0 else NameServer.objects.all()
@@ -104,13 +118,10 @@ class AddDevicesToDNS(Script):
         default_filler = data['default_filler']
 
         for server in nameservers:
-            if not ptr_zone_cust_field_name in server.custom_field_data:
-                reason = "ptr_zone not found! Please run `Add Ptr Zone To Cust Fields` script first"
-                self.log_failure(reason)
-                raise ValueError(reason)
+            ptr_zone_name = data["ptr_zone_name"].name
 
-            if server.custom_field_data[ptr_zone_cust_field_name] is None:
-                self.log_failure(f"ptr zone is empty for `{server}`")
+            if server.custom_field_data[ptr_zone_name] is None:
+                self.log_warning(f"ptr zone is empty for `{server}`")
                 continue
 
             all_ips = {}
@@ -123,9 +134,9 @@ class AddDevicesToDNS(Script):
             jenv = Environment()
             jenv.filters['clear_dns'] = dns_name_clean
 
-            template = jenv.from_string(data['name_template'].replace('\n', '').replace('\r', ''))
+            template = jenv.from_string(name_template)
             valid_records = []
-            zone = Zone.objects.get(pk=server.custom_field_data[ptr_zone_cust_field_name])
+            zone = Zone.objects.get(pk=server.custom_field_data[ptr_zone_name])
 
             for ip in all_ips:
                 context = {
