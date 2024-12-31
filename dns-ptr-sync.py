@@ -1,13 +1,16 @@
 from extras.scripts import Script, BooleanVar, MultiObjectVar, StringVar, TextVar, ObjectVar, ChoiceVar
+
+from dcim.models import Device
 from ipam.models import IPAddress
-from extras.models.customfields import CustomField
-from extras.models import ExportTemplate
-from netbox_dns.models import NameServer, Zone
 from core.models import ObjectType
+from extras.models import ExportTemplate
+from extras.models.customfields import CustomField
+
+from netbox_dns.models import NameServer, Zone
 from netbox_dns.choices import RecordTypeChoices
 
-from pprint import pp
 import re
+from pprint import pp
 from jinja2 import Environment
 
 name = "Add devices to DNS"
@@ -54,6 +57,14 @@ class AddDevicesToDNS(Script):
     allow_none_tenant = BooleanVar(
         description="Allow tenant to be None in nameserver",
         default=False,
+    )
+
+    iterate_over = ChoiceVar(
+        choices=(
+            ('ip', "IP address list"),
+            ('pIP', "Devices primary IP's"),
+        ),
+        default='ip'
     )
 
     only_for_servers = MultiObjectVar(
@@ -124,12 +135,28 @@ class AddDevicesToDNS(Script):
                 self.log_warning(f"ptr zone is empty for `{server}`")
                 continue
 
-            all_ips = {}
-            if server.tenant is not None or data['allow_none_tenant']: #ignore None tenant if allow_none_tenant
-                all_ips = IPAddress.objects.filter(tenant = server.tenant)
-            else:
+            iterate_obj = []
+            if server.tenant is None and not data['allow_none_tenant']: #ignore None tenant if allow_none_tenant
                 self.log_info(f"skip server: {server.name}, tenant is {server.tenant}")
-                continue
+                continue                    
+
+            match (data['iterate_over']):
+                case ('ip'):
+                        iterate_obj = IPAddress.objects.filter(tenant = server.tenant)
+
+                case ('pIP'):
+                    devices = Device.objects.filter(tenant=server.tenant)
+                    iterate_obj = []
+                    for device in devices:
+                        if device.primary_ip4:
+                            iterate_obj.append(device.primary_ip4)
+                        if device.primary_ip6:
+                            iterate_obj.append(device.primary_ip6)
+
+                    pass
+
+                case (_):
+                    self.log_failure("unknown iterate option")
 
             jenv = Environment()
             jenv.filters['clear_dns'] = dns_name_clean
@@ -138,7 +165,7 @@ class AddDevicesToDNS(Script):
             valid_records = []
             zone = Zone.objects.get(pk=server.custom_field_data[ptr_zone_name])
 
-            for ip in all_ips:
+            for ip in iterate_obj:
                 context = {
                     'interface': None,
                     'vm': None,
