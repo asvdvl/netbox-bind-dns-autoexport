@@ -5,6 +5,7 @@ from ipam.models import IPAddress
 from core.models import ObjectType
 from extras.models import ExportTemplate
 from extras.models.customfields import CustomField
+from django.contrib.contenttypes.models import ContentType
 
 from netbox_dns.models import NameServer, Zone
 from netbox_dns.choices import RecordTypeChoices
@@ -16,7 +17,7 @@ from jinja2 import Environment
 name = "Add devices to DNS"
 ptr_zone_cust_field_name_default = 'ptr_zone'
 ENABLE_FILTER_TEMPLATE_SELECTION=True   #enables template filter in AddDevicesToDNS
-FILTER_TEMPLATE_PREFIX='dnsPtrGen'
+FILTER_TEMPLATE_PREFIX='dnsPtrGen-'
 
 def dns_name_clean(name):
     defises = re.sub(r'[^a-zA-Z0-9-]', '-', str(name)) #replaces all invalid characters with -
@@ -49,6 +50,46 @@ class AddPtrZoneToCustFields(Script):
                 default=None
             )
             custom_field.object_types.set([ObjectType.objects.get_for_model(NameServer)])
+        
+        templates = {
+            "per IP(ip-ipID.iface.(vm).device.rack.site.region[])": """{{ data.ip.ip | clear_dns }}-id{{ data.ip_id }}.
+{{ (data.interface if data.interface else filler) | clear_dns }}.
+{% if data.vm %}
+{{ data.vm | clear_dns }}.
+{% endif %}
+{{ (data.device if data.device else filler) | clear_dns }}.
+{{ (data.rack if data.rack else filler) | clear_dns }}.
+{{ (data.site if data.site else filler) | clear_dns }}.
+{{ data.region | map('clear_dns') | join('.') if data.region else filler }}""",
+            
+            "per primaty IPs((vm).device.rack.site.region[])": """{% if data.vm %}
+{{ data.vm | clear_dns }}.
+{% endif %}
+{{ (data.device if data.device else filler) | clear_dns }}.
+{{ (data.rack if data.rack else filler) | clear_dns }}.
+{{ (data.site if data.site else filler) | clear_dns }}.
+{{ data.region | map('clear_dns') | join('.') if data.region else filler }}""",
+        }
+
+        IPAddress_content_type = ContentType.objects.get_for_model(IPAddress)
+        for templ_name in templates:
+            template_name = FILTER_TEMPLATE_PREFIX+templ_name if ENABLE_FILTER_TEMPLATE_SELECTION else templ_name
+            code = templates[templ_name]
+
+            exist_template, created = ExportTemplate.objects.get_or_create(
+                name=template_name,
+                defaults={
+                    "template_code": code,
+                    "as_attachment": False,
+                },
+            )
+
+            if created:
+                exist_template.object_types.set([IPAddress_content_type.id])
+                self.log_info(f"Template '{template_name}' was created.")
+            else:
+                self.log_debug(f"Template '{template_name}' already exists.")
+            
 
 class AddDevicesToDNS(Script):
     class Meta:
