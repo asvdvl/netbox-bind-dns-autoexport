@@ -173,8 +173,10 @@ class AddDevicesToDNS(Script):
 
     def run(self, data, commit):
         nameservers = data["only_for_servers"] if len(data["only_for_servers"]) > 0 else NameServer.objects.all()
+
         name_template = data['name_template'] if data['template'] is None else data['template'].template_code
         name_template = name_template.replace('\n', '').replace('\r', '')
+
         default_filler = data['default_filler']
         multi_record = data['allow_multi_records']
         remove_other_records_in_zone = data['remove_other_records_in_zone']
@@ -197,14 +199,15 @@ class AddDevicesToDNS(Script):
 
                 case ('pIP'):
                     devices = Device.objects.filter(tenant=server.tenant)
-                    iterate_obj = []
-                    for device in devices:
-                        if device.primary_ip4:
-                            iterate_obj.append(device.primary_ip4)
-                        if device.primary_ip6:
-                            iterate_obj.append(device.primary_ip6)
+                    vms = Device.objects.filter(tenant=server.tenant)
 
-                    pass
+                    iterate_obj = []
+                    for machine in [devices, vms]:
+                        for device in machine:
+                            if device.primary_ip4:
+                                iterate_obj.append(device.primary_ip4)
+                            if device.primary_ip6:
+                                iterate_obj.append(device.primary_ip6)
 
                 case (_):
                     self.log_failure("unknown iterate option")
