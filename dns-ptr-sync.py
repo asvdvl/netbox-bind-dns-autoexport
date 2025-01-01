@@ -7,7 +7,7 @@ from extras.models import ExportTemplate
 from extras.models.customfields import CustomField
 from django.contrib.contenttypes.models import ContentType
 
-from netbox_dns.models import NameServer, Zone
+from netbox_dns.models import NameServer, Zone, Record
 from netbox_dns.choices import RecordTypeChoices
 
 import re
@@ -100,6 +100,11 @@ class AddDevicesToDNS(Script):
         default=False,
     )
 
+    allow_multi_records = BooleanVar(
+        description="Allow records to have multiple addresses",
+        default=False,
+    )
+
     iterate_over = ChoiceVar(
         choices=(
             ('ip', "IP address list"),
@@ -162,12 +167,17 @@ class AddDevicesToDNS(Script):
         ).first().id
     )
 
+    def delete_record(self, record):
+        self.log_info(f'removing record `{record.name}`: `{record.value}`')
+        record.delete()
+
     def run(self, data, commit):
-        pp(data)
         nameservers = data["only_for_servers"] if len(data["only_for_servers"]) > 0 else NameServer.objects.all()
         name_template = data['name_template'] if data['template'] is None else data['template'].template_code
         name_template = name_template.replace('\n', '').replace('\r', '')
         default_filler = data['default_filler']
+        multi_record = data['allow_multi_records']
+        remove_other_records_in_zone = data['remove_other_records_in_zone']
 
         for server in nameservers:
             ptr_zone_name = data["ptr_zone_name"].name
@@ -204,8 +214,10 @@ class AddDevicesToDNS(Script):
 
             template = jenv.from_string(name_template)
             valid_records = []
+            domains = []
             zone = Zone.objects.get(pk=server.custom_field_data[ptr_zone_name])
-
+            self.log_debug(f'Server: `{server}`, Zone: `{zone}`')
+            
             for ip in iterate_obj:
                 context = {
                     'interface': None,
@@ -254,27 +266,31 @@ class AddDevicesToDNS(Script):
                     self.log_warning(f"found wrong placed dots, was: `{subdomain}` now: `{fixed_dots_sd}`")
                     subdomain = fixed_dots_sd
 
-                self.log_debug(f"got `{subdomain}` for ip `{ip.address}`")
-                
-                records = zone.records
-                if len(records.model.objects.filter(name=subdomain)) == 0:
-                    records.model.objects.create(
-                        name = subdomain,
-                        value = ip.address.ip,
-                        zone = zone,
-                        type = RecordTypeChoices.AAAA if ip.family == 6 else RecordTypeChoices.A,
-                        tenant = zone.tenant
-                    )
-                    self.log_info(f'added `{subdomain}` record, zone `{zone.name}`')
+                record, created = Record.objects.get_or_create(
+                    name = subdomain,
+                    zone = zone,
+                    type = RecordTypeChoices.AAAA if ip.family == 6 else RecordTypeChoices.A,
+                    tenant = zone.tenant,
+                    value = ip.address.ip,
+                )
+
+                if created:
+                    self.log_info(f'added `{subdomain}`: `{record.value}` record')
                 else:
-                    self.log_debug(f'`{subdomain}` record, already exist in zone `{zone.name}`')
+                    self.log_debug(f'`{subdomain}`: `{record.value}`(DNS)/`{ip.address.ip}`(script) record already exist')
                 
-                valid_records.append(subdomain)
-            
-            if data['remove_other_records_in_zone']:
-                for record in zone.records.exclude(name__in=valid_records).filter(type__in=[RecordTypeChoices.A, RecordTypeChoices.AAAA]):
-                    if record.name not in valid_records:
-                        self.log_info(f'removing {record.name} in {zone.name}')
-                        record.delete()
+                if multi_record or not subdomain in domains:
+                    valid_records.append((subdomain, str(ip.address.ip)))
+                    domains.append(subdomain)
+                elif remove_other_records_in_zone:
+                    self.log_info(f'the record was not added to the list of created entries and will be deleted')
+            # end for server
+
+            if remove_other_records_in_zone:
+                for record in zone.records.filter(type__in=[RecordTypeChoices.A, RecordTypeChoices.AAAA]):
+                    if (record.name, record.value) not in valid_records:
+                        self.delete_record(record)
+
+                
 
 script_order = (AddPtrZoneToCustFields, AddDevicesToDNS)
