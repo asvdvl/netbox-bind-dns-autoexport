@@ -1,9 +1,10 @@
 from extras.scripts import Script, BooleanVar, MultiObjectVar, StringVar, TextVar, ObjectVar, ChoiceVar
 
 from dcim.models import Device
-from ipam.models import IPAddress
+from ipam.models import IPAddress, Service
 from core.models import ObjectType
 from extras.models import ExportTemplate
+from virtualization.models import VirtualMachine
 from extras.models.customfields import CustomField
 from django.contrib.contenttypes.models import ContentType
 
@@ -102,13 +103,14 @@ class AddDevicesToDNS(Script):
 
     allow_multi_records = BooleanVar(
         description="Allow records to have multiple addresses",
-        default=False,
+        default=True,
     )
 
     iterate_over = ChoiceVar(
         choices=(
             ('ip', "IP address list"),
             ('pIP', "Devices primary IP's"),
+            ('services', "Services IP's"),
         ),
         default='ip'
     )
@@ -130,7 +132,7 @@ class AddDevicesToDNS(Script):
 
     remove_other_records_in_zone = BooleanVar(
         description="BE CAREFUL! this will delete all other records in the zone, useful when you allocate a separate zone for generated records, which is recommended",
-        default=False,
+        default=True,
     )
 
     template = ObjectVar(
@@ -145,12 +147,7 @@ class AddDevicesToDNS(Script):
 
     name_template = TextVar(
         label="DNS path template",
-        default="""{{ data.ip.ip | clear_dns }}-id{{ data.ip_id }}.
-{% if data.vm %}
-{{ data.vm | clear_dns }}.
-{% endif %}
-{{ (data.device if data.device else filler) | clear_dns }}
-""",
+        default="""{{ data.service.name }}""",
         description="all line breaks will be removed, use them for formatting"
     )
 
@@ -167,11 +164,18 @@ class AddDevicesToDNS(Script):
         ).first().id
     )
 
+    disable_ptr = BooleanVar(
+        description='simple value pass-through to record',
+        default=False,
+    )
+
     def delete_record(self, record):
         self.log_info(f'removing record `{record.name}`: `{record.value}`')
         record.delete()
 
     def run(self, data, commit):
+        self.log_debug(f'data={pprint.pformat(data)}')
+
         nameservers = data["only_for_servers"] if len(data["only_for_servers"]) > 0 else NameServer.objects.all()
 
         name_template = data['name_template'] if data['template'] is None else data['template'].template_code
@@ -191,23 +195,37 @@ class AddDevicesToDNS(Script):
             iterate_obj = []
             if server.tenant is None and not data['allow_none_tenant']: #ignore None tenant if allow_none_tenant
                 self.log_info(f"skip server: {server.name}, tenant is {server.tenant}")
-                continue                    
+                continue         
+
+            def get_vm_and_dev(tenant):
+                devices = Device.objects.filter(tenant=tenant)
+                vms = VirtualMachine.objects.filter(tenant=tenant)
+                return [devices, vms]
 
             match (data['iterate_over']):
                 case ('ip'):
                         iterate_obj = IPAddress.objects.filter(tenant = server.tenant)
 
                 case ('pIP'):
-                    devices = Device.objects.filter(tenant=server.tenant)
-                    vms = Device.objects.filter(tenant=server.tenant)
-
+                    machines = get_vm_and_dev(server.tenant)
                     iterate_obj = []
-                    for machine in [devices, vms]:
+                    for machine in machines:
                         for device in machine:
                             if device.primary_ip4:
                                 iterate_obj.append(device.primary_ip4)
                             if device.primary_ip6:
                                 iterate_obj.append(device.primary_ip6)
+
+                case ('services'):
+                    machines = get_vm_and_dev(server.tenant)
+                    iterate_obj = []
+                    
+                    services = Service.objects.filter(device__in=machines[0]) | Service.objects.filter(virtual_machine__in=machines[1])
+                    for service in services:
+                        if service.ipaddresses.exists():
+                            #There may be several services at the address(and vice versa), we register the services and ip and divide in the next cycle
+                            for ip in service.ipaddresses.all():
+                                iterate_obj.append((service, ip))
 
                 case (_):
                     self.log_failure("unknown iterate option")
@@ -219,10 +237,12 @@ class AddDevicesToDNS(Script):
             valid_records = []
             domains = []
             zone = Zone.objects.get(pk=server.custom_field_data[ptr_zone_name])
+            tenant = server.tenant
             self.log_debug(f'Server: `{server}`, Zone: `{zone}`')
             
             for ip in iterate_obj:
                 context = {
+                    'service': None,
                     'interface': None,
                     'vm': None,
                     'device': [],
@@ -230,6 +250,10 @@ class AddDevicesToDNS(Script):
                     'site': [],
                     'regions': [[]],
                 }
+
+                if data['iterate_over'] == 'services':
+                    context['service'] = ip[0]
+                    ip = ip[1]
 
                 context['ip'] = ip.address
                 context['ip_id'] = str(ip.id)
@@ -269,12 +293,19 @@ class AddDevicesToDNS(Script):
                     self.log_warning(f"found wrong placed dots, was: `{subdomain}` now: `{fixed_dots_sd}`")
                     subdomain = fixed_dots_sd
 
+                if len(subdomain) == 0:
+                    self.log_info(f"got empty subdomain for ip {ip.address.ip}")
+                    continue
+
                 record, created = Record.objects.get_or_create(
                     name = subdomain,
                     zone = zone,
                     type = RecordTypeChoices.AAAA if ip.family == 6 else RecordTypeChoices.A,
-                    tenant = zone.tenant,
                     value = ip.address.ip,
+                    defaults = {
+                        'disable_ptr': data['disable_ptr'],
+                        'tenant': tenant
+                    }
                 )
 
                 if created:
