@@ -8,11 +8,11 @@ from virtualization.models import VirtualMachine
 from extras.models.customfields import CustomField
 from django.contrib.contenttypes.models import ContentType
 
-from netbox_dns.models import NameServer, Zone, Record
+from netbox_dns.models import Zone, Record
 from netbox_dns.choices import RecordTypeChoices
 
 import re
-from pprint import pp
+from pprint import pp, pformat
 from jinja2 import Environment
 
 name = "Add devices to DNS"
@@ -26,32 +26,10 @@ def dns_name_clean(name):
 
 class AddPtrZoneToCustFields(Script):
     class Meta:
-        name = "Add Ptr Zone To Cust Fields"
-        description = ""
-
-    ptr_zone_cust_field_name = StringVar(
-        label="zone name",
-        default=ptr_zone_cust_field_name_default,
-        description="Enter your value here if you have multiple zones for different purposes"
-    )
+        name = "Create templates"
+        description = "Optionally, adds standard templates for easy use"
 
     def run(self, data, commit):
-        ptr_zone_name = data["ptr_zone_cust_field_name"]
-        fields=CustomField.objects.filter(name = ptr_zone_name)
-
-        if len(fields) == 0:
-            custom_field = CustomField.objects.create(
-                name=ptr_zone_name,
-                label=f"PTR export zone({ptr_zone_name})",
-                type='object',
-                required=False,
-                related_object_type=ObjectType.objects.get_for_model(Zone),
-                is_cloneable=True,
-                description="Zone where DNS records for IP addresses will be generated",
-                default=None
-            )
-            custom_field.object_types.set([ObjectType.objects.get_for_model(NameServer)])
-        
         templates = {
             "per IP(ip-ipID.iface.(vm).device.rack.site.region[])": """{{ data.ip.ip | clear_dns }}-id{{ data.ip_id }}.
 {{ (data.interface if data.interface else filler) | clear_dns }}.
@@ -96,11 +74,6 @@ class AddDevicesToDNS(Script):
     class Meta:
         name = "Add devices to DNS"
 
-    allow_none_tenant = BooleanVar(
-        description="Allow tenant to be None in nameserver",
-        default=False,
-    )
-
     allow_multi_records = BooleanVar(
         description="Allow records to have multiple addresses",
         default=True,
@@ -115,15 +88,16 @@ class AddDevicesToDNS(Script):
         default='ip'
     )
 
-    only_for_servers = MultiObjectVar(
-        label="Specify NameServer",
-        model=NameServer,
-        required=False
+    select_zones = MultiObjectVar(
+        label="Specify Zone(s)",
+        model=Zone,
+        required=True
     )
 
     default_filler = StringVar(
         label="default filler for unknown values",
-        default="no-data"
+        default="no-data",
+        required=False
     )
 
     remove_chain_of_fillers = BooleanVar(
@@ -147,21 +121,12 @@ class AddDevicesToDNS(Script):
 
     name_template = TextVar(
         label="DNS path template",
-        default="""{{ data.service.name }}""",
+        default="""{{ data.ip.ip | clear_dns }}-id{{ data.ip_id }}.
+{% if data.vm %}
+{{ data.vm | clear_dns }}.
+{% endif %}
+{{ (data.device if data.device else filler) | clear_dns }}""",
         description="all line breaks will be removed, use them for formatting"
-    )
-
-    ptr_zone_name = ObjectVar(
-        label="Zone name",
-        description="",
-        model=CustomField,
-        required=True,
-        query_params=(
-            {"related_object_type": "netbox_dns.zone"}
-        ),
-        default=CustomField.objects.filter(
-            name=ptr_zone_cust_field_name_default
-        ).first().id
     )
 
     disable_ptr = BooleanVar(
@@ -174,9 +139,9 @@ class AddDevicesToDNS(Script):
         record.delete()
 
     def run(self, data, commit):
-        self.log_debug(f'data={pprint.pformat(data)}')
+        self.log_debug(f'data={pformat(data)}')
 
-        nameservers = data["only_for_servers"] if len(data["only_for_servers"]) > 0 else NameServer.objects.all()
+        zones = data["select_zones"]
 
         name_template = data['name_template'] if data['template'] is None else data['template'].template_code
         name_template = name_template.replace('\n', '').replace('\r', '')
@@ -185,17 +150,14 @@ class AddDevicesToDNS(Script):
         multi_record = data['allow_multi_records']
         remove_other_records_in_zone = data['remove_other_records_in_zone']
 
-        for server in nameservers:
-            ptr_zone_name = data["ptr_zone_name"].name
-
-            if server.custom_field_data[ptr_zone_name] is None:
-                self.log_warning(f"ptr zone is empty for `{server}`")
-                continue
-
+        for zone in zones:
+            self.log_debug(f'Zone: `{zone}`')
             iterate_obj = []
-            if server.tenant is None and not data['allow_none_tenant']: #ignore None tenant if allow_none_tenant
-                self.log_info(f"skip server: {server.name}, tenant is {server.tenant}")
-                continue         
+
+            tenant = zone.tenant
+
+            if zone.tenant is None:
+                self.log_warning(f"zone: {zone.name}, has tenant {zone.tenant}")
 
             def get_vm_and_dev(tenant):
                 devices = Device.objects.filter(tenant=tenant)
@@ -204,10 +166,10 @@ class AddDevicesToDNS(Script):
 
             match (data['iterate_over']):
                 case ('ip'):
-                        iterate_obj = IPAddress.objects.filter(tenant = server.tenant)
+                    iterate_obj = IPAddress.objects.filter(tenant = tenant)
 
                 case ('pIP'):
-                    machines = get_vm_and_dev(server.tenant)
+                    machines = get_vm_and_dev(tenant)
                     iterate_obj = []
                     for machine in machines:
                         for device in machine:
@@ -217,7 +179,7 @@ class AddDevicesToDNS(Script):
                                 iterate_obj.append(device.primary_ip6)
 
                 case ('services'):
-                    machines = get_vm_and_dev(server.tenant)
+                    machines = get_vm_and_dev(tenant)
                     iterate_obj = []
                     
                     services = Service.objects.filter(device__in=machines[0]) | Service.objects.filter(virtual_machine__in=machines[1])
@@ -236,9 +198,6 @@ class AddDevicesToDNS(Script):
             template = jenv.from_string(name_template)
             valid_records = []
             domains = []
-            zone = Zone.objects.get(pk=server.custom_field_data[ptr_zone_name])
-            tenant = server.tenant
-            self.log_debug(f'Server: `{server}`, Zone: `{zone}`')
             
             for ip in iterate_obj:
                 context = {
@@ -318,13 +277,9 @@ class AddDevicesToDNS(Script):
                     domains.append(subdomain)
                 elif remove_other_records_in_zone:
                     self.log_info(f'the record was not added to the list of created entries and will be deleted')
-            # end for server
+            # end for zone
 
             if remove_other_records_in_zone:
                 for record in zone.records.filter(type__in=[RecordTypeChoices.A, RecordTypeChoices.AAAA]):
                     if (record.name, record.value) not in valid_records:
                         self.delete_record(record)
-
-                
-
-script_order = (AddPtrZoneToCustFields, AddDevicesToDNS)
